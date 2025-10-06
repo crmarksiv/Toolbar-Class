@@ -1,0 +1,423 @@
+    #Requires AutoHotkey v2.0.2+
+
+    ;================= Toolbar Class v1.0.0 =================
+    ; Description: Production-ready toolbar class for AutoHotkey v2
+    ; Features: Button management, tooltips, icons, validation, error handling
+    ;=================
+
+    class Toolbar {
+        ; Properties
+        hwnd := 0                    ; Toolbar window handle
+        hImageList := 0              ; ImageList handle
+        arrayButtons := []           ; Array of button objects
+        objParentGui := ""           ; Parent GUI object
+        objControl := ""             ; Custom control object
+        intNextCmdID := 1000         ; Next command ID to assign
+        mapCallbacks := Map()        ; Map of command IDs to callbacks
+        mapTooltips := Map()         ; Map of command IDs to tooltip text
+        boolDebug := false           ; Debug mode flag
+        parentHwnd := 0              ; Parent GUI window handle
+        strLogFile := ""             ; Log file path
+        strCurrentTooltip := ""      ; Current tooltip string (persists for pointer)
+        boolWarningShown := false    ; Flag to prevent repeated warnings
+        boolIconWarningShown := false ; Flag to prevent repeated icon file warnings
+
+        ; Constructor - Creates toolbar and attaches to GUI
+        ; Parameters: guiObj - parent Gui object, options - positioning options
+        __New(objGui, strOptions := "x0 y0 w800 h35") {
+            ; Validate parent GUI object
+            if (!IsObject(objGui)) {
+                strError := "ERROR: Invalid GUI object passed to Toolbar constructor. Expected Gui object, got " Type(objGui) "."
+                throw TypeError(strError, -1, "First parameter must be a Gui object")
+            }
+
+            if (!objGui.HasProp("hwnd")) {
+                strError := "ERROR: Invalid GUI object passed to Toolbar constructor. Object does not have 'hwnd' property."
+                throw TypeError(strError, -1, "GUI object must have hwnd property")
+            }
+
+            if (!objGui.hwnd || objGui.hwnd = 0) {
+                strError := "ERROR: Invalid GUI object passed to Toolbar constructor. GUI hwnd is invalid or zero."
+                throw ValueError(strError, -1, "GUI must have valid window handle")
+            }
+
+            this.objParentGui := objGui
+            this.parentHwnd := objGui.hwnd
+
+            ; Create toolbar custom control with styles:
+            ; 0x0800 = TBSTYLE_FLAT (flat appearance)
+            ; 0x1000 = TBSTYLE_LIST (shows text next to icons)
+            ; 0x0100 = TBSTYLE_TOOLTIPS (automatic tooltip support)
+            this.objControl := objGui.AddCustom("ClassToolbarWindow32 " strOptions " +0x1900")
+            this.hwnd := this.objControl.hwnd
+
+            ; Initialize toolbar
+            this.initialize()
+
+            ; Setup notification handler using OnMessage for WM_NOTIFY
+            OnMessage(0x004E, ObjBindMethod(this, "handleNotify"))
+        }
+
+        ; Initializes toolbar with required messages
+        initialize() {
+            ; Set button structure size
+            intPtrSize := A_PtrSize
+            intTbButtonSize := (intPtrSize = 8) ? 32 : 20
+            SendMessage(0x41E, intTbButtonSize, 0, this.hwnd)  ; TB_BUTTONSTRUCTSIZE
+
+            ; Set button size - wider to accommodate text
+            SendMessage(0x41F, 0, (25 << 16) | 100, this.hwnd)  ; TB_SETBUTTONSIZE (height | width)
+
+            ; Set max text rows to 1 so text appears on button
+            SendMessage(0x043C, 1, 0, this.hwnd)  ; TB_SETMAXTEXTROWS
+
+            ; Create ImageList
+            this.hImageList := DllCall("comctl32\ImageList_Create",
+                "int", 16,
+                "int", 16,
+                "uint", 0x21,  ; ILC_COLOR32 | ILC_MASK
+                "int", 10,
+                "int", 10,
+                "ptr")
+
+            ; Set ImageList for toolbar
+            SendMessage(0x430, 0, this.hImageList, this.hwnd)  ; TB_SETIMAGELIST
+        }
+
+        ; Adds a button to the toolbar
+        ; Parameters: text - button text/tooltip, callback - function to call, iconFile - icon source, iconIndex - icon number, tooltipText - custom tooltip (optional)
+        Add(strText, funcCallback, strIconFile := "", intIconIndex := 1, strTooltip := "") {
+            ; Validate callback is a valid function
+            if (!IsObject(funcCallback)) {
+                strError := "ERROR: Invalid callback for button '" strText "'. Callback must be a function object, not a " Type(funcCallback) "."
+                if (this.boolDebug)
+                    this.LogMessage(strError)
+                throw TypeError(strError, -1, "Expected function object for callback parameter")
+            }
+
+            if (Type(funcCallback) != "Func") {
+                strError := "ERROR: Invalid callback for button '" strText "'. Expected Func type, got " Type(funcCallback) "."
+                if (this.boolDebug)
+                    this.LogMessage(strError)
+                throw TypeError(strError, -1, "Callback must be a Func object")
+            }
+
+            ; Validate icon file exists if provided
+            if (strIconFile != "" && !FileExist(strIconFile)) {
+                strWarning := "WARNING: Icon file not found for button '" strText "': " strIconFile "`nButton will be created without an icon."
+
+                ; Always log to debug file if enabled
+                if (this.boolDebug) {
+                    this.LogMessage(strWarning)
+                }
+
+                ; Show message box warning only once per toolbar instance
+                if (!this.boolIconWarningShown) {
+                    MsgBox(strWarning "`n`nPlease verify:`n- File path is correct`n- File exists at the specified location`n`nThis warning will only show once.", "Toolbar Icon File Warning", "Icon! 48")
+                    this.boolIconWarningShown := true
+                }
+
+                ; Clear the icon file so button will be created without icon
+                strIconFile := ""
+            }
+
+            ; Validate that button has at least text or icon
+            if (strText = "" && strIconFile = "") {
+                strWarning := "WARNING: Button added with no text and no icon. Button may be invisible."
+
+                ; Always log to debug file if enabled
+                if (this.boolDebug) {
+                    this.LogMessage(strWarning)
+                }
+
+                ; Show message box warning only once per toolbar instance
+                if (!this.boolWarningShown) {
+                    MsgBox(strWarning "`n`nA button should have either:`n- Text (button label)`n- Icon (image file)`n- Both`n`nThis warning will only show once.", "Toolbar Validation Warning", "Icon! 48")
+                    this.boolWarningShown := true
+                }
+            }
+
+            ; Use custom tooltip or default to button text
+            strActualTooltip := (strTooltip != "") ? strTooltip : strText
+
+            ; Load and add icon to ImageList
+            intImageIndex := -1
+            if (strIconFile != "") {
+                intImageIndex := this.addIcon(strIconFile, intIconIndex)
+            }
+
+            ; Generate unique command ID
+            intCmdID := this.intNextCmdID++
+
+            ; Store callback and tooltip
+            this.mapCallbacks[intCmdID] := funcCallback
+            this.mapTooltips[intCmdID] := strActualTooltip
+
+            ; Create button object
+            objButton := {
+                cmdID: intCmdID,
+                text: strText,
+                tooltip: strActualTooltip,
+                imageIndex: intImageIndex,
+                callback: funcCallback,
+                enabled: true,
+                visible: true
+            }
+
+            ; Add to buttons array
+            this.arrayButtons.Push(objButton)
+
+            ; Add button to toolbar
+            this.addButtonToToolbar(intCmdID, intImageIndex, strText)
+
+            return intCmdID
+        }
+
+        ; Adds a separator to the toolbar
+        AddSeparator() {
+            ; Create separator button structure
+            intPtrSize := A_PtrSize
+            intStructSize := (intPtrSize = 8) ? 32 : 20
+            bufButton := Buffer(intStructSize, 0)
+
+            NumPut("int", 0, bufButton, 0)           ; iBitmap - no image
+            NumPut("int", 0, bufButton, 4)           ; idCommand - no command
+            NumPut("uchar", 0, bufButton, 8)         ; fsState - no state
+            NumPut("uchar", 0x01, bufButton, 9)      ; fsStyle - BTNS_SEP (separator)
+
+            ; Add separator to toolbar
+            SendMessage(0x414, 1, bufButton.Ptr, this.hwnd)  ; TB_ADDBUTTONS
+        }
+
+        ; Internal method to add icon to ImageList
+        ; Returns the index of the added icon
+        addIcon(strIconFile, intIconIndex) {
+            ; Load icon
+            hIcon := LoadPicture(strIconFile, "Icon" intIconIndex " w16 h16", &imageType)
+
+            ; Add to ImageList
+            intIndex := DllCall("comctl32\ImageList_AddIcon",
+                "ptr", this.hImageList,
+                "ptr", hIcon)
+
+            return intIndex
+        }
+
+        ; Internal method to add button structure to toolbar
+        addButtonToToolbar(intCmdID, intImageIndex, strText) {
+            ; First, add the string to the toolbar's string table using TB_ADDSTRING
+            ; Create double-null terminated string for button label
+            intTextLen := StrLen(strText)
+            bufText := Buffer((intTextLen + 2) * 2, 0)  ; +2 for double null terminator
+            StrPut(strText, bufText, "UTF-16")
+
+            ; Add string and get its index
+            intStringIndex := SendMessage(0x44D, 0, bufText.Ptr, this.hwnd)  ; TB_ADDSTRING
+
+            ; Create TBBUTTON structure
+            intPtrSize := A_PtrSize
+            intStructSize := (intPtrSize = 8) ? 32 : 20
+            bufButton := Buffer(intStructSize, 0)
+
+            NumPut("int", intImageIndex, bufButton, 0)        ; iBitmap
+            NumPut("int", intCmdID, bufButton, 4)             ; idCommand
+            NumPut("uchar", 0x04, bufButton, 8)               ; fsState - TBSTATE_ENABLED
+            NumPut("uchar", 0x08, bufButton, 9)               ; fsStyle - BTNS_SHOWTEXT
+
+            ; Use string index for button text
+            intStringOffset := (intPtrSize = 8) ? 24 : 16
+            NumPut("int", intStringIndex, bufButton, intStringOffset)  ; iString - string index
+
+            ; Add button to toolbar
+            SendMessage(0x414, 1, bufButton.Ptr, this.hwnd)  ; TB_ADDBUTTONS
+        }
+
+        ; Enables a button by command ID
+        Enable(intCmdID) {
+            SendMessage(0x401, intCmdID, 0x00010001, this.hwnd)  ; TB_ENABLEBUTTON
+        }
+
+        ; Disables a button by command ID
+        Disable(intCmdID) {
+            SendMessage(0x401, intCmdID, 0x00000000, this.hwnd)  ; TB_ENABLEBUTTON
+        }
+
+        ; Shows a button by command ID
+        Show(intCmdID) {
+            SendMessage(0x408, intCmdID, 0x00010001, this.hwnd)  ; TB_HIDEBUTTON (inverted)
+        }
+
+        ; Hides a button by command ID
+        Hide(intCmdID) {
+            SendMessage(0x408, intCmdID, 0x00000001, this.hwnd)  ; TB_HIDEBUTTON
+        }
+
+        ; Auto-sizes the toolbar
+        AutoSize() {
+            SendMessage(0x421, 0, 0, this.hwnd)  ; TB_AUTOSIZE
+        }
+
+        ; Resizes the toolbar
+        Resize(intWidth, intHeight) {
+            this.objControl.Move(0, 0, intWidth, intHeight)
+            this.AutoSize()
+        }
+
+        ; Gets the number of buttons
+        GetButtonCount() {
+            return SendMessage(0x418, 0, 0, this.hwnd)  ; TB_BUTTONCOUNT
+        }
+
+        ; Handles WM_NOTIFY messages from toolbar
+        handleNotify(wParam, lParam, msg, hwnd) {
+            ; Log all notifications if debug enabled
+            if (this.boolDebug) {
+                this.LogMessage("WM_NOTIFY received - wParam: " wParam " lParam: " lParam " msg: " msg " hwnd: " hwnd)
+            }
+
+            ; CRITICAL: Only process notifications sent to our parent GUI window
+            if (hwnd != this.parentHwnd) {
+                if (this.boolDebug) {
+                    this.LogMessage("SKIPPED - hwnd (" hwnd ") != parentHwnd (" this.parentHwnd ")")
+                }
+                return
+            }
+
+            ; Read notification code
+            intCode := NumGet(lParam, A_PtrSize * 2, "int")
+
+            ; Get the hwndFrom to verify source
+            intHwndFrom := NumGet(lParam, 0, "ptr")
+            intIdFrom := NumGet(lParam, A_PtrSize, "uint")
+
+            if (this.boolDebug) {
+                this.LogMessage("Processing - Code: " intCode " hwndFrom: " intHwndFrom " idFrom: " intIdFrom)
+            }
+
+            ; Handle TBN_GETINFOTIP notification codes
+            ; TBN_GETINFOTIPA = -530
+            ; TBN_GETINFOTIPW = -531
+            if (intCode = -530 || intCode = -531) {
+                ; NMTBGETINFOTIP structure (64-bit):
+                ; Offset  0: HWND hwndFrom (8 bytes)
+                ; Offset  8: UINT_PTR idFrom (8 bytes)
+                ; Offset 16: UINT code (4 bytes)
+                ; Offset 20: padding (4 bytes)
+                ; Offset 24: LPWSTR pszText (8 bytes)
+                ; Offset 32: int cchTextMax (4 bytes)
+                ; Offset 36: int iItem (4 bytes)
+                ; Offset 40: LPARAM lParam (8 bytes)
+
+                ; Get command ID from hdr.idFrom
+                intCmdID := NumGet(lParam, A_PtrSize, "uint")
+
+                if (this.boolDebug) {
+                    this.LogMessage("TBN_GETINFOTIP - CmdID: " intCmdID " HasTooltip: " this.mapTooltips.Has(intCmdID))
+                    if (this.mapTooltips.Has(intCmdID)) {
+                        this.LogMessage("Tooltip text: " this.mapTooltips[intCmdID])
+                    }
+                }
+
+                ; Check if we have a tooltip for this command ID
+                if (this.mapTooltips.Has(intCmdID)) {
+                    strTooltip := this.mapTooltips[intCmdID]
+
+                    ; Calculate correct offsets
+                    intPszTextOffset := A_PtrSize * 3
+                    intCchTextMaxOffset := A_PtrSize * 4
+
+                    ptrPszText := NumGet(lParam, intPszTextOffset, "ptr")
+                    intCchTextMax := NumGet(lParam, intCchTextMaxOffset, "int")
+
+                    if (this.boolDebug) {
+                        this.LogMessage("pszText: " ptrPszText " cchTextMax: " intCchTextMax)
+                    }
+
+                    ; If buffer exists and has size, write to it
+                    if (ptrPszText != 0 && intCchTextMax > 0) {
+                        StrPut(strTooltip, ptrPszText, intCchTextMax, "UTF-16")
+                        if (this.boolDebug) {
+                            this.LogMessage("Tooltip written to provided buffer")
+                        }
+                    }
+                    ; If no buffer provided (cchTextMax = 0), set lpszText to point to our string
+                    else if (ptrPszText != 0) {
+                        ; Store tooltip in a class property so it persists
+                        this.strCurrentTooltip := strTooltip
+                        ; Change pszText to point to our string
+                        NumPut("ptr", StrPtr(this.strCurrentTooltip), lParam, intPszTextOffset)
+                        if (this.boolDebug) {
+                            this.LogMessage("Tooltip set via pointer (cchTextMax was 0)")
+                        }
+                    }
+                }
+                return 0
+            }
+
+            ; For NM_CLICK (-2), execute the button callback
+            if (intCode = -2) {
+                if (this.boolDebug) {
+                    this.LogMessage("NM_CLICK detected")
+                }
+
+                ; NMTOOLBAR structure: NMHDR (3 pointers) + iItem(int) + TBBUTTON structure
+                ; Get button command ID from iItem field
+                intOffset := A_PtrSize * 3
+                intCmdID := NumGet(lParam + intOffset, "int")
+
+                if (this.boolDebug) {
+                    this.LogMessage("Button clicked - CmdID: " intCmdID)
+                }
+
+                ; Execute callback if it exists
+                if (this.mapCallbacks.Has(intCmdID)) {
+                    funcCallback := this.mapCallbacks[intCmdID]
+                    funcCallback()
+                }
+            }
+        }
+
+        ; Enable/disable debug mode
+        SetDebug(boolEnable) {
+            this.boolDebug := boolEnable
+
+            ; Create log file if debug enabled
+            if (boolEnable) {
+                this.strLogFile := A_ScriptDir "\ToolbarDebug.log"
+                try {
+                    ; Clear existing log file
+                    FileDelete(this.strLogFile)
+                }
+                this.LogMessage("=== Toolbar Debug Log Started ===")
+                this.LogMessage("Parent HWND: " this.parentHwnd)
+                this.LogMessage("Toolbar HWND: " this.hwnd)
+            }
+        }
+
+        ; Log message to file
+        LogMessage(strMessage) {
+            if (!this.boolDebug)
+                return
+
+            strTimestamp := FormatTime(, "yyyy-MM-dd HH:mm:ss")
+            strLogLine := strTimestamp " - " strMessage "`n"
+
+            try {
+                FileAppend(strLogLine, this.strLogFile)
+            } catch as objError {
+                ToolTip("Log Error: " objError.Message)
+            }
+        }
+
+        ; Destructor - Cleanup resources
+        __Delete() {
+            ; Remove message handler
+            OnMessage(0x004E, ObjBindMethod(this, "handleNotify"), 0)
+
+            ; Destroy ImageList
+            if (this.hImageList)
+                DllCall("comctl32\ImageList_Destroy", "ptr", this.hImageList)
+        }
+    }
+
+    ;================= End of Toolbar Class =================
